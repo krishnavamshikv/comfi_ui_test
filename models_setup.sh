@@ -10,8 +10,8 @@
 #   bash setup_models.sh
 #
 # Safe to re-run: already-downloaded files with the correct size are
-# skipped. Every run writes a timestamped log to the logs/ folder next
-# to this script, plus keeps updating logs/latest.log.
+# skipped. Every run writes a clean, readable log to logs/latest.log
+# (and a timestamped copy) — no raw wget progress spam.
 ###############################################################################
 
 set -uo pipefail  # NOTE: no -e on purpose — one failed download must not kill the rest
@@ -29,61 +29,131 @@ TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 LOG_FILE="${LOG_DIR}/setup_${TIMESTAMP}.log"
 LATEST_LOG="${LOG_DIR}/latest.log"
 
-# Send everything to both the terminal and the log file
-exec > >(tee -a "$LOG_FILE" "$LATEST_LOG") 2>&1
+# Everything printed with `log` goes to screen AND to both log files.
+# (We do NOT pipe wget's own raw output through this — that's the part
+# that looked ugly — we generate our own clean lines instead.)
+log () {
+  echo -e "$1" | tee -a "$LOG_FILE" "$LATEST_LOG"
+}
 
 FAILED_ITEMS=()
 SKIPPED_ITEMS=()
 OK_ITEMS=()
 
-echo "==============================================================="
-echo " ComfyUI Model Setup — started at $(date)"
-echo " ComfyUI dir: $COMFYUI_DIR"
-echo " Log file:    $LOG_FILE"
-echo "==============================================================="
+TOTAL_ITEMS=11
+CURRENT_ITEM=0
+
+# ---------------------------------------------------------------------------
+# Speed check: wget uses a single connection, which Hugging Face throttles
+# per-stream (~10-15MB/s) regardless of your pod's real bandwidth.
+# aria2c splits each download into parallel connections and is MUCH faster
+# on high-bandwidth boxes like RunPod. We auto-install it if missing.
+# ---------------------------------------------------------------------------
+USE_ARIA2=0
+if command -v aria2c >/dev/null 2>&1; then
+  USE_ARIA2=1
+else
+  log "[SETUP] aria2c not found — installing it for much faster parallel downloads..."
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -y >/dev/null 2>&1 && apt-get install -y aria2 >/dev/null 2>&1
+  fi
+  if command -v aria2c >/dev/null 2>&1; then
+    USE_ARIA2=1
+    log "[SETUP] aria2c installed successfully — using parallel downloads."
+  else
+    log "[SETUP] Could not install aria2c (no apt access) — falling back to single-connection wget (slower)."
+  fi
+fi
+
+human_size () {
+  # Pretty-print bytes as e.g. 6.9G / 350M
+  numfmt --to=iec --suffix=B "$1" 2>/dev/null || echo "${1} bytes"
+}
+
+log "==============================================================="
+log " ComfyUI Model Setup — started at $(date)"
+log " ComfyUI dir: $COMFYUI_DIR"
+log " Log file:    $LOG_FILE"
+log "==============================================================="
 
 if [ ! -d "$COMFYUI_DIR" ]; then
-  echo "[FATAL] ComfyUI directory not found at $COMFYUI_DIR"
-  echo "        Edit the COMFYUI_DIR variable at the top of this script and re-run."
+  log "[FATAL] ComfyUI directory not found at $COMFYUI_DIR"
+  log "        Edit the COMFYUI_DIR variable at the top of this script and re-run."
   exit 1
 fi
 
 # ---------------------------------------------------------------------------
-# Helper function: download_model <url> <dest_path> <min_size_bytes> <label>
+# download_model <url> <dest_path> <expected_size_bytes> <label>
+#
+# Runs wget quietly in the background, then polls the partial file's size
+# every 5 seconds and prints ONE clean status line per check — instead of
+# wget's dot-matrix spam. Also prints an overall [n/11] counter.
 # ---------------------------------------------------------------------------
 download_model () {
   local url="$1"
   local dest="$2"
-  local min_size="$3"
+  local expected_size="$3"
   local label="$4"
+
+  CURRENT_ITEM=$((CURRENT_ITEM + 1))
+  local tag="[${CURRENT_ITEM}/${TOTAL_ITEMS}]"
 
   mkdir -p "$(dirname "$dest")"
 
-  # Skip if the file already exists and looks complete (size check)
+  # Skip if already downloaded and looks complete
   if [ -f "$dest" ]; then
     local existing_size
     existing_size=$(stat -c%s "$dest" 2>/dev/null || echo 0)
-    if [ "$existing_size" -ge "$min_size" ]; then
-      echo "[SKIP] $label already present and looks complete ($(numfmt --to=iec "$existing_size" 2>/dev/null || echo "$existing_size bytes")) -> $dest"
+    if [ "$existing_size" -ge "$expected_size" ]; then
+      log "$tag SKIP  ${label} — already downloaded ($(human_size "$existing_size"))"
       SKIPPED_ITEMS+=("$label")
       return 0
     else
-      echo "[INFO] $label exists but looks incomplete (${existing_size} bytes) — re-downloading"
+      log "$tag INFO  ${label} — found incomplete file, re-downloading"
       rm -f "$dest"
     fi
   fi
 
-  echo "[GET]  $label"
-  echo "       URL:  $url"
-  echo "       Dest: $dest"
+  log "$tag START ${label}"
+  log "       -> $dest"
 
-  # -c resumes partial downloads, retries handle flaky connections,
-  # --content-disposition follows HF's real filename if it differs
-  wget -c --tries=5 --timeout=60 --content-disposition \
-       -O "$dest" "$url"
+  local dl_pid
+  if [ "$USE_ARIA2" -eq 1 ]; then
+    # 16 parallel connections, split into 16 pieces, auto-resume on retry
+    aria2c -q -x16 -s16 -k1M --continue=true --max-tries=5 --retry-wait=5 \
+      -d "$(dirname "$dest")" -o "$(basename "$dest")" "$url" &
+    dl_pid=$!
+  else
+    wget -q -c --tries=5 --timeout=60 -O "$dest" "$url" &
+    dl_pid=$!
+  fi
 
-  if [ $? -ne 0 ]; then
-    echo "[FAIL] wget reported an error for $label"
+  local last_size=0
+  local last_time=$SECONDS
+
+  while kill -0 "$dl_pid" 2>/dev/null; do
+    sleep 5
+    local cur_size
+    cur_size=$(stat -c%s "$dest" 2>/dev/null || echo 0)
+    local now=$SECONDS
+    local elapsed=$(( now - last_time ))
+    [ "$elapsed" -lt 1 ] && elapsed=1
+    local speed_bps=$(( (cur_size - last_size) / elapsed ))
+    local pct=0
+    if [ "$expected_size" -gt 0 ]; then
+      pct=$(( cur_size * 100 / expected_size ))
+      [ "$pct" -gt 100 ] && pct=100
+    fi
+    log "$tag ...   ${pct}% — $(human_size "$cur_size") / ~$(human_size "$expected_size")  ($(human_size "$speed_bps")/s)"
+    last_size=$cur_size
+    last_time=$now
+  done
+
+  wait "$dl_pid"
+  local dl_exit=$?
+
+  if [ "$dl_exit" -ne 0 ]; then
+    log "$tag FAIL  ${label} — download exited with error code $dl_exit"
     FAILED_ITEMS+=("$label")
     return 1
   fi
@@ -91,13 +161,13 @@ download_model () {
   local final_size
   final_size=$(stat -c%s "$dest" 2>/dev/null || echo 0)
 
-  if [ "$final_size" -lt "$min_size" ]; then
-    echo "[FAIL] $label downloaded but is too small (${final_size} bytes, expected >= ${min_size}). Likely a broken/redirected download."
+  if [ "$final_size" -lt "$expected_size" ]; then
+    log "$tag FAIL  ${label} — downloaded but too small ($(human_size "$final_size"), expected ~$(human_size "$expected_size")). Likely a broken/redirected download."
     FAILED_ITEMS+=("$label")
     return 1
   fi
 
-  echo "[OK]   $label — $(numfmt --to=iec "$final_size" 2>/dev/null || echo "$final_size bytes")"
+  log "$tag DONE  ${label} — $(human_size "$final_size")"
   OK_ITEMS+=("$label")
   return 0
 }
@@ -108,7 +178,7 @@ download_model () {
 download_model \
   "https://huggingface.co/SG161222/RealVisXL_V5.0/resolve/main/RealVisXL_V5.0_fp16.safetensors?download=true" \
   "${MODELS_DIR}/checkpoints/RealVisXL_V5.0_fp16.safetensors" \
-  6000000000 \
+  6900000000 \
   "RealVisXL V5.0 checkpoint"
 
 # ---------------------------------------------------------------------------
@@ -117,43 +187,44 @@ download_model \
 download_model \
   "https://huggingface.co/InstantX/InstantID/resolve/main/ip-adapter.bin?download=true" \
   "${MODELS_DIR}/instantid/ip-adapter.bin" \
-  1500000000 \
+  1690000000 \
   "InstantID ip-adapter model"
 
 download_model \
   "https://huggingface.co/InstantX/InstantID/resolve/main/ControlNetModel/diffusion_pytorch_model.safetensors?download=true" \
   "${MODELS_DIR}/controlnet/InstantID_ControlNet.safetensors" \
-  2000000000 \
+  2500000000 \
   "InstantID ControlNet model"
 
 # antelopev2 face analysis (zip -> extracted with python, no unzip needed)
 ANTELOPE_DIR="${MODELS_DIR}/insightface/models/antelopev2"
 ANTELOPE_ZIP="${MODELS_DIR}/insightface/models/antelopev2.zip"
+CURRENT_ITEM=$((CURRENT_ITEM + 1))
+TAG="[${CURRENT_ITEM}/${TOTAL_ITEMS}]"
 if [ -f "${ANTELOPE_DIR}/glintr100.onnx" ]; then
-  echo "[SKIP] antelopev2 face models already present -> $ANTELOPE_DIR"
+  log "$TAG SKIP  antelopev2 face models — already present"
   SKIPPED_ITEMS+=("antelopev2 face models")
 else
   mkdir -p "$ANTELOPE_DIR"
-  echo "[GET]  antelopev2 face analysis models"
-  wget -c --tries=5 --timeout=60 -O "$ANTELOPE_ZIP" \
+  log "$TAG START antelopev2 face analysis models"
+  wget -q -c --tries=5 --timeout=60 -O "$ANTELOPE_ZIP" \
     "https://huggingface.co/MonsterMMORPG/tools/resolve/main/antelopev2.zip?download=true"
   if [ $? -eq 0 ] && [ -f "$ANTELOPE_ZIP" ]; then
     python3 -c "import zipfile; zipfile.ZipFile('${ANTELOPE_ZIP}').extractall('${MODELS_DIR}/insightface/models')"
-    # handle possible nested folder from the zip
     if [ -d "${ANTELOPE_DIR}/antelopev2" ]; then
       mv "${ANTELOPE_DIR}/antelopev2"/* "${ANTELOPE_DIR}/"
       rmdir "${ANTELOPE_DIR}/antelopev2"
     fi
     rm -f "$ANTELOPE_ZIP"
     if [ -f "${ANTELOPE_DIR}/glintr100.onnx" ]; then
-      echo "[OK]   antelopev2 face models extracted"
+      log "$TAG DONE  antelopev2 face models extracted"
       OK_ITEMS+=("antelopev2 face models")
     else
-      echo "[FAIL] antelopev2 extraction didn't produce expected files — check $ANTELOPE_DIR manually"
+      log "$TAG FAIL  antelopev2 extraction didn't produce expected files — check $ANTELOPE_DIR manually"
       FAILED_ITEMS+=("antelopev2 face models")
     fi
   else
-    echo "[FAIL] antelopev2 download failed"
+    log "$TAG FAIL  antelopev2 download failed"
     FAILED_ITEMS+=("antelopev2 face models")
   fi
 fi
@@ -164,19 +235,19 @@ fi
 download_model \
   "https://huggingface.co/h94/IP-Adapter-FaceID/resolve/main/ip-adapter-faceid-plusv2_sdxl.bin?download=true" \
   "${MODELS_DIR}/ipadapter/ip-adapter-faceid-plusv2_sdxl.bin" \
-  800000000 \
+  830000000 \
   "IPAdapter FaceID Plus v2 (SDXL)"
 
 download_model \
   "https://huggingface.co/h94/IP-Adapter-FaceID/resolve/main/ip-adapter-faceid-plusv2_sdxl_lora.safetensors?download=true" \
   "${MODELS_DIR}/loras/ip-adapter-faceid-plusv2_sdxl_lora.safetensors" \
-  50000000 \
+  370000000 \
   "IPAdapter FaceID Plus v2 LoRA (SDXL)"
 
 download_model \
   "https://huggingface.co/h94/IP-Adapter/resolve/main/models/image_encoder/model.safetensors?download=true" \
   "${MODELS_DIR}/clip_vision/CLIP-ViT-H-14-laion2B-s32B-b79K.safetensors" \
-  2000000000 \
+  2500000000 \
   "CLIP Vision encoder (for IPAdapter)"
 
 # ---------------------------------------------------------------------------
@@ -185,13 +256,13 @@ download_model \
 download_model \
   "https://huggingface.co/thibaud/controlnet-openpose-sdxl-1.0/resolve/main/OpenPoseXL2.safetensors?download=true" \
   "${MODELS_DIR}/controlnet/OpenPoseXL2.safetensors" \
-  4000000000 \
+  5000000000 \
   "ControlNet OpenPose (SDXL)"
 
 download_model \
   "https://huggingface.co/diffusers/controlnet-depth-sdxl-1.0/resolve/main/diffusion_pytorch_model.fp16.safetensors?download=true" \
   "${MODELS_DIR}/controlnet/controlnet-depth-sdxl-1.0_fp16.safetensors" \
-  2000000000 \
+  2500000000 \
   "ControlNet Depth (SDXL, fp16)"
 
 # ---------------------------------------------------------------------------
@@ -200,37 +271,37 @@ download_model \
 download_model \
   "https://huggingface.co/datasets/Gourieff/ReActor/resolve/main/models/inswapper_128.onnx?download=true" \
   "${MODELS_DIR}/insightface/inswapper_128.onnx" \
-  500000000 \
+  554000000 \
   "ReActor inswapper_128 face-swap model"
 
 download_model \
   "https://github.com/TencentARC/GFPGAN/releases/download/v1.3.4/GFPGANv1.4.pth" \
   "${MODELS_DIR}/facerestore_models/GFPGANv1.4.pth" \
-  300000000 \
+  349000000 \
   "GFPGAN v1.4 face restoration model"
 
 # ---------------------------------------------------------------------------
 # SUMMARY
 # ---------------------------------------------------------------------------
-echo ""
-echo "==============================================================="
-echo " SUMMARY — finished at $(date)"
-echo "==============================================================="
-echo "OK (${#OK_ITEMS[@]}):"
-for i in "${OK_ITEMS[@]:-}"; do [ -n "$i" ] && echo "   - $i"; done
-echo ""
-echo "SKIPPED / already present (${#SKIPPED_ITEMS[@]}):"
-for i in "${SKIPPED_ITEMS[@]:-}"; do [ -n "$i" ] && echo "   - $i"; done
-echo ""
+log ""
+log "==============================================================="
+log " SUMMARY — finished at $(date)"
+log "==============================================================="
+log "OK (${#OK_ITEMS[@]}):"
+for i in "${OK_ITEMS[@]:-}"; do [ -n "$i" ] && log "   - $i"; done
+log ""
+log "SKIPPED / already present (${#SKIPPED_ITEMS[@]}):"
+for i in "${SKIPPED_ITEMS[@]:-}"; do [ -n "$i" ] && log "   - $i"; done
+log ""
 if [ "${#FAILED_ITEMS[@]}" -gt 0 ]; then
-  echo "FAILED (${#FAILED_ITEMS[@]}):"
-  for i in "${FAILED_ITEMS[@]}"; do echo "   - $i"; done
-  echo ""
-  echo "Re-run this script to retry only the failed/incomplete files."
-  echo "Full log saved at: $LOG_FILE"
+  log "FAILED (${#FAILED_ITEMS[@]}):"
+  for i in "${FAILED_ITEMS[@]}"; do log "   - $i"; done
+  log ""
+  log "Re-run this script to retry only the failed/incomplete files."
+  log "Full log saved at: $LOG_FILE"
   exit 1
 else
-  echo "All models downloaded/verified successfully."
-  echo "Full log saved at: $LOG_FILE"
+  log "All models downloaded/verified successfully."
+  log "Full log saved at: $LOG_FILE"
   exit 0
 fi
