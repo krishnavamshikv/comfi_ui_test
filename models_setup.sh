@@ -119,8 +119,12 @@ download_model () {
 
   local dl_pid
   if [ "$USE_ARIA2" -eq 1 ]; then
-    # 16 parallel connections, split into 16 pieces, auto-resume on retry
-    aria2c -q -x16 -s16 -k1M --continue=true --max-tries=5 --retry-wait=5 \
+    # Parallel connections for speed, but tuned to avoid the "hangs after
+    # 100%" issue: file-allocation=none avoids slow/hanging preallocation
+    # on container/network filesystems, and connections are capped at 8
+    # (still much faster than single-stream wget, more stable than 16).
+    aria2c -q -x8 -s8 -j8 --file-allocation=none --continue=true \
+      --max-tries=5 --retry-wait=5 --timeout=60 --disable-ipv6=true \
       -d "$(dirname "$dest")" -o "$(basename "$dest")" "$url" &
     dl_pid=$!
   else
@@ -130,6 +134,7 @@ download_model () {
 
   local last_size=0
   local last_time=$SECONDS
+  local stall_at_100_count=0
 
   while kill -0 "$dl_pid" 2>/dev/null; do
     sleep 5
@@ -147,6 +152,22 @@ download_model () {
     log "$tag ...   ${pct}% — $(human_size "$cur_size") / ~$(human_size "$expected_size")  ($(human_size "$speed_bps")/s)"
     last_size=$cur_size
     last_time=$now
+
+    # Watchdog: aria2c sometimes finishes the actual file transfer but hangs
+    # closing its parallel connections. If we've been sitting at 100% with
+    # zero throughput for ~30s, the file is done — force-kill the process
+    # so the script can move on instead of waiting forever.
+    if [ "$pct" -ge 100 ] && [ "$speed_bps" -le 0 ]; then
+      stall_at_100_count=$((stall_at_100_count + 1))
+    else
+      stall_at_100_count=0
+    fi
+    if [ "$stall_at_100_count" -ge 6 ]; then
+      log "$tag INFO  Transfer reached 100% but process hasn't exited (likely closing connections) — forcing it to finish."
+      kill -9 "$dl_pid" 2>/dev/null
+      wait "$dl_pid" 2>/dev/null
+      break
+    fi
   done
 
   wait "$dl_pid"
