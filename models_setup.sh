@@ -11,7 +11,7 @@
 set -euo pipefail
 
 # ---- config -----------------------------------------------------------------
-COMFYUI="${COMFYUI:-/workspace/ComfyUI}"          # override: COMFYUI=/path bash download_models.sh
+COMFYUI="${COMFYUI:-/workspace/runpod-slim/ComfyUI}"          # override: COMFYUI=/path bash download_models.sh
 JOBS=16                                            # aria2c connections per file
 
 echo ">> ComfyUI dir: $COMFYUI"
