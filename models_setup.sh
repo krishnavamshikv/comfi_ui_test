@@ -1,97 +1,86 @@
 #!/usr/bin/env bash
-# ==========================================================================
-# AI Influencer MVP — model + custom node bootstrap for ComfyUI on RunPod
-# Re-run this on every fresh pod. Idempotent (skips files that already exist).
-#
-# Usage:
-#   export HF_TOKEN=hf_xxx        # needed for the gated FLUX Kontext file
-#   cd /workspace/runpod-slim/ComfyUI         # <-- set this to your actual ComfyUI root
-#   bash setup_models.sh
-# ==========================================================================
-set -euo pipefail
+set -e
 
-COMFYUI_DIR="${COMFYUI_DIR:-$(pwd)}"
-echo "Installing into: $COMFYUI_DIR"
+echo "=== 1. Installing System Dependencies ==="
+apt-get update && apt-get install -y aria2 git wget
 
-if [ -z "${HF_TOKEN:-}" ]; then
-  echo "WARNING: HF_TOKEN is not set. The FLUX Kontext dev download is a gated"
-  echo "repo and will fail without it. Get a token at https://huggingface.co/settings/tokens"
-  echo "and accept the license at https://huggingface.co/black-forest-labs/FLUX.1-Kontext-dev"
+# Define ComfyUI root (standard RunPod PyTorch/ComfyUI template path)
+COMFY_DIR="/workspace/runpod-slim/ComfyUI"
+if [ ! -d "$COMFY_DIR" ]; then
+    echo "Cloning ComfyUI..."
+    git clone https://github.com/comfyanonymous/ComfyUI.git "$COMFY_DIR"
 fi
 
-mkdir -p "$COMFYUI_DIR"/models/{diffusion_models,text_encoders,vae,controlnet}
-mkdir -p "$COMFYUI_DIR"/custom_nodes
+cd "$COMFY_DIR/custom_nodes"
 
-dl () {
-  # dl <url> <output_path> [use_auth]
-  local url="$1" out="$2" auth="${3:-no}"
-  if [ -f "$out" ]; then
-    echo "SKIP (exists): $out"
-    return
-  fi
-  echo "Downloading -> $out"
-  if [ "$auth" = "auth" ]; then
-    wget -q --show-progress --header="Authorization: Bearer ${HF_TOKEN:-}" -O "$out" "$url"
-  else
-    wget -q --show-progress -O "$out" "$url"
-  fi
+echo "=== 2. Cloning Essential Custom Nodes ==="
+# ComfyUI Manager (for dependency resolution)
+[ ! -d "ComfyUI-Manager" ] && git clone https://github.com/ltdrdata/ComfyUI-Manager.git
+# IP-Adapter Plus (for Phase 1 face & identity preservation)
+[ ! -d "ComfyUI_IPAdapter_plus" ] && git clone https://github.com/cubiq/ComfyUI_IPAdapter_plus.git
+# Advanced ControlNet & DWPose Aux (for pose extraction from image & video)
+[ ! -d "ComfyUI-Advanced-ControlNet" ] && git clone https://github.com/Kosinkadink/ComfyUI-Advanced-ControlNet.git
+[ ! -d "comfyui_controlnet_aux" ] && git clone https://github.com/Fannovel16/comfyui_controlnet_aux.git
+# VideoHelperSuite (for video loading, frame extraction, and MP4 export)
+[ ! -d "ComfyUI-VideoHelperSuite" ] && git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git
+# MimicMotion / AnimateDiff (for Phase 2 dance & expression video generation)
+[ ! -d "ComfyUI-MimicMotion" ] && git clone https://github.com/Gourieff/comfyui-mimicmotion.git
+[ ! -d "ComfyUI-AnimateDiff-Evolved" ] && git clone https://github.com/Kosinkadink/ComfyUI-AnimateDiff-Evolved.git
+
+echo "=== 3. Installing Node Python Requirements ==="
+pip install -r "$COMFY_DIR/custom_nodes/comfyui_controlnet_aux/requirements.txt"
+pip install -r "$COMFY_DIR/custom_nodes/ComfyUI-VideoHelperSuite/requirements.txt"
+pip install -r "$COMFY_DIR/custom_nodes/ComfyUI-MimicMotion/requirements.txt" || true
+
+echo "=== 4. Downloading Models via aria2c (16x Concurrent Connections) ==="
+# Function for fast downloading
+download_model() {
+    local url=$1
+    local dir=$2
+    local out=$3
+    mkdir -p "$dir"
+    echo "Downloading $out to $dir..."
+    aria2c -x 16 -s 16 -k 1M -d "$dir" -o "$out" "$url"
 }
 
-# --------------------------------------------------------------------------
-# PHASE 1 — FLUX.1 Kontext Dev (character pose + outfit transfer, image)
-# --------------------------------------------------------------------------
-dl "https://huggingface.co/Comfy-Org/flux1-kontext-dev_ComfyUI/resolve/main/split_files/diffusion_models/flux1-dev-kontext_fp8_scaled.safetensors" \
-   "$COMFYUI_DIR/models/diffusion_models/flux1-dev-kontext_fp8_scaled.safetensors" auth
+# 1. Base SDXL Model (RealVisXL V4.0 - optimized for photorealistic people/influencers)
+download_model \
+  "https://huggingface.co/SG161222/RealVisXL_V4.0/resolve/main/RealVisXL_V4.0.safetensors" \
+  "$COMFY_DIR/models/checkpoints" \
+  "RealVisXL_V4.0.safetensors"
 
-dl "https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/clip_l.safetensors" \
-   "$COMFYUI_DIR/models/text_encoders/clip_l.safetensors"
+# 2. CLIP Vision Models (Required for IP-Adapter)
+download_model \
+  "https://huggingface.co/h94/IP-Adapter/resolve/main/models/image_encoder/model.safetensors" \
+  "$COMFY_DIR/models/clip_vision" \
+  "CLIP-ViT-H-14-laion2B-s32B-b79K.safetensors"
 
-dl "https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp8_e4m3fn_scaled.safetensors" \
-   "$COMFYUI_DIR/models/text_encoders/t5xxl_fp8_e4m3fn_scaled.safetensors"
+# 3. IP-Adapter SDXL Weights (FaceID & General Plus for identity & style)
+download_model \
+  "https://huggingface.co/h94/IP-Adapter/resolve/main/sdxl_models/ip-adapter-plus-face_sdxl_vit-h.safetensors" \
+  "$COMFY_DIR/models/ipadapter" \
+  "ip-adapter-plus-face_sdxl_vit-h.safetensors"
+download_model \
+  "https://huggingface.co/h94/IP-Adapter/resolve/main/sdxl_models/ip-adapter-plus_sdxl_vit-h.safetensors" \
+  "$COMFY_DIR/models/ipadapter" \
+  "ip-adapter-plus_sdxl_vit-h.safetensors"
 
-# Flux VAE — pulled from the non-gated schnell repo, identical VAE weights
-dl "https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/ae.safetensors" \
-   "$COMFYUI_DIR/models/vae/ae.safetensors"
+# 4. ControlNet OpenPose SDXL (For Phase 1 pose matching)
+download_model \
+  "https://huggingface.co/xinsir/controlnet-openpose-sdxl-1.0/resolve/main/diffusion_pytorch_model.safetensors" \
+  "$COMFY_DIR/models/controlnet" \
+  "controlnet-openpose-sdxl-1.0.safetensors"
 
-# --------------------------------------------------------------------------
-# PHASE 2 — Wan2.1 VACE (image + motion-control video -> video)
-# 1.3B = MVP / fast iteration. Swap for the 14B VACE file later for quality.
-# --------------------------------------------------------------------------
-dl "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/diffusion_models/wan2.1_vace_1.3B_fp16.safetensors" \
-   "$COMFYUI_DIR/models/diffusion_models/wan2.1_vace_1.3B_fp16.safetensors"
+# 5. MimicMotion / AnimateDiff Motion Weights (For Phase 2 dance video generation)
+download_model \
+  "https://huggingface.co/TencentARC/MimicMotion/resolve/main/MimicMotion_1-1.pth" \
+  "$COMFY_DIR/models/mimicmotion" \
+  "MimicMotion_1-1.pth"
+download_model \
+  "https://huggingface.co/guoyww/animatediff/resolve/main/mm_sdxl_v10_beta.ckpt" \
+  "$COMFY_DIR/models/animatediff_models" \
+  "mm_sdxl_v10_beta.ckpt"
 
-dl "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors" \
-   "$COMFYUI_DIR/models/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors"
-
-dl "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/vae/wan_2.1_vae.safetensors" \
-   "$COMFYUI_DIR/models/vae/wan_2.1_vae.safetensors"
-
-# --------------------------------------------------------------------------
-# Custom nodes (needed for video I/O + pose extraction in Phase 2)
-# --------------------------------------------------------------------------
-cd "$COMFYUI_DIR/custom_nodes"
-
-if [ ! -d "ComfyUI-VideoHelperSuite" ]; then
-  git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git
-fi
-
-if [ ! -d "comfyui_controlnet_aux" ]; then
-  git clone https://github.com/Fannovel16/comfyui_controlnet_aux.git
-fi
-
-if [ ! -d "ComfyUI-Manager" ]; then
-  git clone https://github.com/Comfy-Org/ComfyUI-Manager.git
-fi
-
-echo ""
-echo "Installing custom node python deps..."
-for d in ComfyUI-VideoHelperSuite comfyui_controlnet_aux ComfyUI-Manager; do
-  if [ -f "$d/requirements.txt" ]; then
-    pip install -q -r "$d/requirements.txt" --break-system-packages || true
-  fi
-done
-
-echo ""
-echo "=========================================================="
-echo "Done. Restart ComfyUI so it picks up the new nodes/models."
-echo "=========================================================="
+echo "=== Setup Complete! Starting ComfyUI ==="
+cd "$COMFY_DIR"
+python main.py --listen 0.0.0.0 --port 8188
