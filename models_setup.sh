@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -e
+export GIT_TERMINAL_PROMPT=0
 
 echo "=== 1. Installing System Dependencies ==="
 apt-get update && apt-get install -y aria2 git wget
@@ -24,13 +25,14 @@ echo "=== 2. Cloning Essential Custom Nodes ==="
 # VideoHelperSuite (for video loading, frame extraction, and MP4 export)
 [ ! -d "ComfyUI-VideoHelperSuite" ] && git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git
 # MimicMotion / AnimateDiff (for Phase 2 dance & expression video generation)
-[ ! -d "ComfyUI-MimicMotion" ] && git clone https://github.com/Gourieff/comfyui-mimicmotion.git
+# Corrected MimicMotion Wrapper repository
+[ ! -d "ComfyUI-MimicMotionWrapper" ] && git clone https://github.com/kijai/ComfyUI-MimicMotionWrapper.git
 [ ! -d "ComfyUI-AnimateDiff-Evolved" ] && git clone https://github.com/Kosinkadink/ComfyUI-AnimateDiff-Evolved.git
 
 echo "=== 3. Installing Node Python Requirements ==="
 pip install -r "$COMFY_DIR/custom_nodes/comfyui_controlnet_aux/requirements.txt"
 pip install -r "$COMFY_DIR/custom_nodes/ComfyUI-VideoHelperSuite/requirements.txt"
-pip install -r "$COMFY_DIR/custom_nodes/ComfyUI-MimicMotion/requirements.txt" || true
+pip install -r "$COMFY_DIR/custom_nodes/ComfyUI-MimicMotionWrapper/requirements.txt" || true
 
 echo "=== 4. Downloading Models via aria2c (16x Concurrent Connections) ==="
 # Function for fast downloading
