@@ -11,7 +11,7 @@
 set -euo pipefail
 
 # ---- config -----------------------------------------------------------------
-COMFYUI="${COMFYUI:-/workspace/runpod-slim/ComfyUI}"          # override: COMFYUI=/path bash download_models.sh
+COMFYUI="${COMFYUI:-/workspace/ComfyUI}"          # override: COMFYUI=/path bash download_models.sh
 JOBS=16                                            # aria2c connections per file
 
 echo ">> ComfyUI dir: $COMFYUI"
@@ -20,28 +20,46 @@ echo ">> ComfyUI dir: $COMFYUI"
 # ---- ensure aria2c ----------------------------------------------------------
 if ! command -v aria2c >/dev/null 2>&1; then
   echo ">> installing aria2c"
-  apt-get update -y && apt-get install -y aria2 || (pip install --quiet aria2p; true)
+  apt-get update -y && apt-get install -y aria2 curl || (pip install --quiet aria2p; true)
 fi
 
-# ---- HuggingFace auth (uses HF_TOKEN if exported; optional for the mirrors below,
-#      required if you switch any URL to a gated repo e.g. black-forest-labs/FLUX.1-dev) --
+# ---- HuggingFace auth --------------------------------------------------------
+# IMPORTANT: do NOT feed an "Authorization" header to aria2c. HF's Xet backend
+# 302-redirects to a *pre-signed, byte-range-locked* CDN URL; forwarding an auth
+# header onto that signed URL makes the CDN return 403. aria2c downloads the
+# default (public) files correctly on its own. The token is only needed for
+# *gated* repos, which are pulled with `hf download` (Xet-aware) via hfdl() below.
 HF_TOKEN="${HF_TOKEN:-}"
-HF_HEADER=()
 if [ -n "$HF_TOKEN" ]; then
-  HF_HEADER=(--header="Authorization: Bearer $HF_TOKEN")
-  echo ">> HF_TOKEN detected — sending auth header on downloads"
+  echo ">> HF_TOKEN detected (used only for gated repos via hfdl)"
+  export HF_TOKEN                      # picked up automatically by the hf CLI
+  pip install --quiet -U "huggingface_hub[cli,hf_transfer]" >/dev/null 2>&1 || true
+  export HF_HUB_ENABLE_HF_TRANSFER=1   # fast parallel chunked download
 else
-  echo ">> no HF_TOKEN set — relying on public mirrors (fine for the default URLs)"
+  echo ">> no HF_TOKEN set — public mirrors below need none"
 fi
 
-# ---- helper: dl <dest_dir> <out_name> <url> ---------------------------------
+# ---- helper: dl <dest_dir> <out_name> <url>  (PUBLIC files, aria2c) ----------
 dl () {
   local dir="$1" out="$2" url="$3"
   mkdir -p "$dir"
   if [ -f "$dir/$out" ]; then echo "   exists: $out"; return 0; fi
   echo ">> $out"
   aria2c -c -x"$JOBS" -s"$JOBS" -k1M --console-log-level=warn --summary-interval=0 \
-         "${HF_HEADER[@]}" -d "$dir" -o "$out" "$url"
+         -d "$dir" -o "$out" "$url"
+}
+
+# ---- helper: hfdl <dest_dir> <out_name> <repo_id> <path_in_repo> -------------
+# For GATED / Xet repos (needs HF_TOKEN + you must have accepted the repo terms).
+hfdl () {
+  local dir="$1" out="$2" repo="$3" path="$4"
+  mkdir -p "$dir"
+  if [ -f "$dir/$out" ]; then echo "   exists: $out"; return 0; fi
+  echo ">> (hf) $out  <-  $repo/$path"
+  hf download "$repo" "$path" --local-dir "$dir" >/dev/null
+  # flatten if the file landed in a subpath, and normalize the name
+  local got; got=$(find "$dir" -type f -name "$(basename "$path")" | head -1)
+  [ -n "$got" ] && [ "$got" != "$dir/$out" ] && mv -f "$got" "$dir/$out"
 }
 
 # =============================================================================
@@ -70,6 +88,10 @@ M="$COMFYUI/models"
 # --- Flux base (fp8 UNet, fits 48GB with headroom for PuLID+CN+IPA) ---------
 dl "$M/diffusion_models" flux1-dev-fp8.safetensors \
    https://huggingface.co/Kijai/flux-fp8/resolve/main/flux1-dev-fp8.safetensors
+# Prefer the OFFICIAL full-precision Flux instead? It's gated — accept terms at
+# https://huggingface.co/black-forest-labs/FLUX.1-dev then use (needs HF_TOKEN):
+#   hfdl "$M/diffusion_models" flux1-dev.safetensors black-forest-labs/FLUX.1-dev flux1-dev.safetensors
+#   hfdl "$M/vae"             ae.safetensors        black-forest-labs/FLUX.1-dev ae.safetensors
 
 # --- Flux text encoders ------------------------------------------------------
 dl "$M/text_encoders" t5xxl_fp16.safetensors \
